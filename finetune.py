@@ -1,5 +1,8 @@
 import os
-os.environ["TORCH_DYNAMO_DISABLE"] = "1"
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+torch._dynamo.config.suppress_errors = True
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
 import torch
@@ -10,7 +13,7 @@ from trl import SFTTrainer
 from transformers import TrainingArguments, TrainerCallback
 import setproctitle
 
-max_seq_length = 2048
+max_seq_length = 1024
 dtype = None
 load_in_4bit = True
 
@@ -28,7 +31,7 @@ model = FastLanguageModel.get_peft_model(
     lora_alpha=16,
     lora_dropout=0,
     bias="none",
-    use_gradient_checkpointing=True,
+    use_gradient_checkpointing="unsloth",
     random_state=3407,
     use_rslora=False,
     loftq_config=None,
@@ -79,9 +82,9 @@ trainer = SFTTrainer(
         dataset_text_field="text",
         max_seq_length=max_seq_length,
         dataset_num_proc=1,
-        packing=False,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
+        packing=True,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
         warmup_steps=5,
         max_steps=100,
         learning_rate=2e-4,
