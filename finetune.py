@@ -26,14 +26,14 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 
 model = FastLanguageModel.get_peft_model(
     model,
-    r=32, # Tăng r lên 32 để mô hình có sức chứa lớn hơn, học đặc trưng tiếng Việt tốt hơn
+    r=32,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     lora_alpha=32,
-    lora_dropout=0.05, # Thêm chút dropout để chống overfit (giúp nhớ lâu, khái quát tốt)
+    lora_dropout=0.05,
     bias="none",
     use_gradient_checkpointing="unsloth",
     random_state=3407,
-    use_rslora=True, # Bật Rank-Stabilized LoRA giúp huấn luyện với rank cao ổn định hơn
+    use_rslora=True,
     loftq_config=None,
 )
 
@@ -70,8 +70,10 @@ class ProcessTitleCallback(TrainerCallback):
         if logs is not None:
             step = state.global_step
             loss = logs.get("loss", 0.0)
+            lr = logs.get("learning_rate", 0.0)
             epoch = state.epoch if state.epoch else 0
-            setproctitle.setproctitle(f"Train - Ep: {epoch:.2f} Step: {step} Loss: {loss:.4f}")
+            total_epochs = args.num_train_epochs
+            setproctitle.setproctitle(f"Train - Ep: {epoch:.2f}/{total_epochs} Step: {step} Loss: {loss:.4f} LR: {lr:.2e}")
 
 from trl import SFTConfig
 
@@ -86,15 +88,15 @@ trainer = SFTTrainer(
         packing=True,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
-        warmup_ratio=0.05, # Sử dụng tỷ lệ phần trăm thay vì số step cố định cho tập dữ liệu lớn
-        num_train_epochs=2, # Huấn luyện toàn bộ dataset qua 2 epoch (thay vì max_steps)
-        learning_rate=1e-4, # Giảm learning rate xuống một chút để mô hình học từ từ, nhớ lâu
+        warmup_ratio=0.05,
+        num_train_epochs=10,
+        learning_rate=1e-4,
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
-        logging_steps=10, # Log mỗi 10 bước thay vì 1 để đỡ rác console
+        logging_steps=10,
         optim="adamw_8bit",
         weight_decay=0.01,
-        lr_scheduler_type="cosine", # Cosine scheduler giúp giảm lr mượt mà, tránh quên (catastrophic forgetting)
+        lr_scheduler_type="cosine",
         seed=3407,
         output_dir="outputs",
         disable_tqdm=False,
