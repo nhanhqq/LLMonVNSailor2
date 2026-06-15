@@ -1,3 +1,5 @@
+import os
+os.environ["TORCH_DYNAMO_DISABLE"] = "1"
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
 import torch
@@ -26,7 +28,7 @@ model = FastLanguageModel.get_peft_model(
     lora_alpha=16,
     lora_dropout=0,
     bias="none",
-    use_gradient_checkpointing="unsloth",
+    use_gradient_checkpointing=True,
     random_state=3407,
     use_rslora=False,
     loftq_config=None,
@@ -76,7 +78,7 @@ trainer = SFTTrainer(
     args=SFTConfig(
         dataset_text_field="text",
         max_seq_length=max_seq_length,
-        dataset_num_proc=2,
+        dataset_num_proc=1,
         packing=False,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
