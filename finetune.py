@@ -13,7 +13,7 @@ dtype = None
 load_in_4bit = True
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="unsloth/gemma-4-e2b-it-bnb-4bit",
+    model_name="google/gemma-4-e2b-it",
     max_seq_length=max_seq_length,
     dtype=dtype,
     load_in_4bit=load_in_4bit,
