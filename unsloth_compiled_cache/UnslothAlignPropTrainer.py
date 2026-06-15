@@ -441,7 +441,7 @@ class UnslothAlignPropConfig(AlignPropConfig):
     
     def __init__(
         self,
-        exp_name = 'finetune',
+        exp_name = 'export_gguf',
         run_name = '',
         seed = 3407,
         log_with = None,

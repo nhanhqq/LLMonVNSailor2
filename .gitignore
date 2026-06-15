@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+.venv/
+
+# Deep Learning / Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.onnx
+
+# Training outputs & Checkpoints
+outputs/
+checkpoint-*/
+gemma-rag-model/
+gemma-rag-model_gguf/
+unsloth_compiled_cache/
+
+# Lora Adapters (bỏ comment nếu bạn KHÔNG muốn push lora weights lên Git)
+# gemma-rag-lora/
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
