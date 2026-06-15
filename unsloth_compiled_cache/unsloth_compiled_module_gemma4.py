@@ -1,8 +1,8 @@
 """
 2026.6.5
 2026.6.7
-5.5.0
-0.24.0
+5.13.0.dev0
+0.23.0
 __UNSLOTH_VERSIONING__
 """
 
@@ -177,7 +177,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from unsloth_zoo.temporary_patches.common import torch_compile
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from transformers.models.gemma4.modeling_gemma4 import (F, math, Callable, Optional, torch, nn, init, ACT2FN, Cache, PreTrainedConfig, GenerationMixin, create_causal_mask, create_sliding_window_causal_mask, FlashAttentionKwargs, BaseModelOutputWithPast, ModelOutput, CausalLMOutputWithPast, ROPE_INIT_FUNCTIONS, dynamic_rope_update, ALL_ATTENTION_FUNCTIONS, PreTrainedModel, Unpack, TransformersKwargs, can_return_tuple, maybe_autocast, Gemma4AudioConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig, Gemma4CausalLMOutputWithPast, Gemma4AudioCausalConv1d, Gemma4PreTrainedModel, Gemma4TextModel, Gemma4ForCausalLM, Gemma4Model, Gemma4ForConditionalGeneration, __name__, Gemma4TextExperts, create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask)
+from transformers.models.gemma4.modeling_gemma4 import (F, math, Callable, Optional, torch, nn, init, ACT2FN, Cache, PreTrainedConfig, GenerationMixin, FlashAttentionKwargs, ModelOutput, ROPE_INIT_FUNCTIONS, dynamic_rope_update, ALL_ATTENTION_FUNCTIONS, PreTrainedModel, Unpack, TransformersKwargs, can_return_tuple, maybe_autocast, Gemma4AudioConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig, Gemma4CausalLMOutputWithPast, Gemma4TextModelOutputWithPast, Gemma4AudioCausalConv1d, Gemma4PreTrainedModel, Gemma4TextModel, Gemma4ForCausalLM, Gemma4Model, Gemma4ForConditionalGeneration, __name__, Gemma4TextExperts, create_masks_for_generate)
 
 @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def Gemma4ClippableLinear_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -240,7 +240,7 @@ class Gemma4RMSNorm(nn.Module):
 @torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
 @torch.no_grad()
 def Gemma4AudioRelPositionalEncoding_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    position_ids = torch.arange(12, -1, -1, device=hidden_states.device)
+    position_ids = torch.arange(self.context_size // 2, -1, -1, device=hidden_states.device)
     position_ids = position_ids[..., None]
     scaled_time = position_ids * self.inv_timescales.to(device=hidden_states.device)
     pos_embed = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=-1)
@@ -249,7 +249,7 @@ def Gemma4AudioRelPositionalEncoding_forward(self, hidden_states: torch.Tensor) 
 class Gemma4AudioRelPositionalEncoding(nn.Module):
     """Sinusoidal relative positional encoding for the audio encoder.
 
-    Produces position embeddings of shape [1, 2*context_size - 1, hidden_size] with
+    Produces position embeddings of shape [1, context_size // 2 + 1, hidden_size] with
     concatenated [sin..., cos...] layout matching the original Gemma4 convention.
     """
 
@@ -346,7 +346,7 @@ class Gemma4AudioSubSampleConvProjection(nn.Module):
 @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def Gemma4AudioFeedForward_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     # This is needed to avoid any underflow/overflow issues when clipping
-    gradient_clipping = min(self.gradient_clipping, torch.finfo(self.ffw_layer_1.linear.weight.dtype).max)
+    gradient_clipping = min(self.gradient_clipping, torch.finfo(hidden_states.dtype).max)
 
     residual = hidden_states
     hidden_states = torch.clamp(hidden_states, -gradient_clipping, gradient_clipping)
@@ -393,7 +393,7 @@ def Gemma4AudioLightConv1d_forward(self, hidden_states: torch.Tensor) -> torch.T
     hidden_states = self.depthwise_conv1d(hidden_states.transpose(1, 2)).transpose(1, 2)
 
     # This is needed to avoid any underflow/overflow issues when clipping
-    gradient_clipping = min(self.gradient_clipping, torch.finfo(self.linear_start.linear.weight.dtype).max)
+    gradient_clipping = min(self.gradient_clipping, torch.finfo(hidden_states.dtype).max)
     hidden_states = torch.clamp(hidden_states, -gradient_clipping, gradient_clipping)
     hidden_states = self.conv_norm(hidden_states)
 
@@ -886,6 +886,7 @@ def Gemma4TextAttention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: torch.Tensor,
     attention_mask: torch.Tensor | None,
+    shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
     past_key_values: Cache | None = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -899,9 +900,11 @@ def Gemma4TextAttention_forward(
     query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
     query_states = query_states.transpose(1, 2)
 
-    # For layers with shared KV (from kv sharing point onwards), we reuse the same keys/values states as the last non-sharing layer
-    if self.is_kv_shared_layer and past_key_values is not None:
-        key_states, value_states = past_key_values.shared_layers[self.kv_shared_layer_index]
+    # For layers with shared KV (from kv sharing point onwards), we reuse the same keys/values states as the last non-sharing layer.
+    # We cannot simply reuse the cached state if we have a Cache, as sliding layers will not remember the full states in their Cache
+    # once we are past the sliding window - so we always use `shared_kv_states` instead, even when past_key_values is not None
+    if self.is_kv_shared_layer:
+        key_states, value_states = shared_kv_states[self.layer_type]
         # Device of past layer may be different from current one
         key_states = key_states.to(query_states.device)
         value_states = value_states.to(query_states.device)
@@ -916,17 +919,14 @@ def Gemma4TextAttention_forward(
         value_states = self.v_norm(value_states)
         value_states = value_states.transpose(1, 2)
 
-    if past_key_values is not None:
-        if not self.is_kv_shared_layer:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
-        if self.store_full_length_kv:
-            if not hasattr(past_key_values, "shared_layers"):
-                past_key_values.shared_layers = {}
-            past_key_values.shared_layers[self.layer_idx] = key_states, value_states
+    if past_key_values is not None and not self.is_kv_shared_layer:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+    if self.store_full_length_kv:
+        shared_kv_states[self.layer_type] = key_states, value_states
 
-    attention_interface: Callable = eager_attention_forward
-    if self.config._attn_implementation != "eager":
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
 
     attn_output, attn_weights = attention_interface(
         self,
@@ -967,32 +967,31 @@ class Gemma4TextAttention(nn.Module):
 
         # Shared kv cache
         first_kv_shared_layer_idx = self.config.num_hidden_layers - getattr(self.config, "num_kv_shared_layers", 0)
-        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx >= 0
         prev_layers = config.layer_types[:first_kv_shared_layer_idx]
-        if self.is_kv_shared_layer:
-            # For shared layers, find the last non-shared layer of the same type before sharing starts
-            self.kv_shared_layer_index = len(prev_layers) - 1 - prev_layers[::-1].index(config.layer_types[layer_idx])
-            self.store_full_length_kv = False
-        else:
-            self.kv_shared_layer_index = None
-            # For non-shared layers, store full-length kv if this is the last non-shared layer of its type
-            self.store_full_length_kv = layer_idx == len(prev_layers) - 1 - prev_layers[::-1].index(
-                config.layer_types[layer_idx]
-            )
+        self.store_full_length_kv = not self.is_kv_shared_layer and layer_idx == len(prev_layers) - 1 - prev_layers[
+            ::-1
+        ].index(config.layer_types[layer_idx])
 
-        self.q_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
-        self.v_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
-
-        self.k_proj = nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
-        self.v_proj = (
-            nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
-            if not self.use_alternative_attention
-            else None
-        )
+        self.q_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+
+        # Layers sharing kv states don't need any weight matrices
+        if not self.is_kv_shared_layer:
+            self.k_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+            self.v_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+
+            self.k_proj = nn.Linear(
+                config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.v_proj = (
+                nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
+                if not self.use_alternative_attention
+                else None
+            )
+
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
@@ -1002,10 +1001,11 @@ class Gemma4TextAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
         attention_mask: torch.Tensor | None,
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
         past_key_values: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return Gemma4TextAttention_forward(self, hidden_states=hidden_states, position_embeddings=position_embeddings, attention_mask=attention_mask, past_key_values=past_key_values, **kwargs)
+        return Gemma4TextAttention_forward(self, hidden_states=hidden_states, position_embeddings=position_embeddings, attention_mask=attention_mask, shared_kv_states=shared_kv_states, past_key_values=past_key_values, **kwargs)
 
 
 
@@ -1087,9 +1087,17 @@ def Gemma4ForCausalLM_forward(
     labels: torch.LongTensor | None = None,
     use_cache: bool | None = None,
     logits_to_keep: int | torch.Tensor = 0,
+    per_layer_inputs: torch.Tensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
-) -> CausalLMOutputWithPast:
+) -> Gemma4CausalLMOutputWithPast:
     r"""
+    per_layer_inputs (`torch.Tensor`, *optional*):
+        Pre-computed per-layer input text embeddings of shape `(batch_size, sequence_length, num_hidden_layers,
+        hidden_size_per_layer_input)`. When provided, these are used directly instead of being computed from `input_ids`
+        via `get_per_layer_inputs()` in the text model. If calling the `forward` with `inputs_embeds` instead of `input_ids`,
+        you should probably precompute them and forward them along `inputs_embeds`, otherwise recomputing them needs
+        to reverse the main embedding, which is expensive.
+
     Example:
 
     ```python
@@ -1107,12 +1115,13 @@ def Gemma4ForCausalLM_forward(
     "What is your favorite condiment?"
     ```"""
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-    outputs: BaseModelOutputWithPast = self.model(
+    outputs: Gemma4TextModelOutputWithPast = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
+        per_layer_inputs=per_layer_inputs,
         use_cache=use_cache,
         **kwargs,
     )
@@ -1246,12 +1255,13 @@ def Gemma4ForCausalLM_forward(
         loss = self.loss_function(logits, labels.to(self.lm_head.weight.device), vocab_size=self.vocab_size, **kwargs)
 
 
-    return CausalLMOutputWithPast(
+    return Gemma4CausalLMOutputWithPast(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
+        shared_kv_states=outputs.shared_kv_states,
     )
 
 class Gemma4ForCausalLM(Gemma4PreTrainedModel, GenerationMixin):
@@ -1281,9 +1291,10 @@ class Gemma4ForCausalLM(Gemma4PreTrainedModel, GenerationMixin):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        per_layer_inputs: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutputWithPast:
-        return Gemma4ForCausalLM_forward(self, input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache, logits_to_keep=logits_to_keep, **kwargs)
+    ) -> Gemma4CausalLMOutputWithPast:
+        return Gemma4ForCausalLM_forward(self, input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache, logits_to_keep=logits_to_keep, per_layer_inputs=per_layer_inputs, **kwargs)
 
 Gemma4ForCausalLM.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True
 
@@ -1335,93 +1346,17 @@ class Gemma4MultimodalEmbedder(nn.Module):
         return Gemma4MultimodalEmbedder_forward(self, inputs_embeds=inputs_embeds)
 
 
-def token_type_ids_mask_function(
-    token_type_ids: torch.Tensor | None,
-    image_group_ids: torch.Tensor | None,
-) -> Callable | None:
-    """
-    This function adds the correct offsets to the `q_idx` and `kv_idx` as the torch API can only accept lengths,
-    not start and end indices.
-    """
-    # Do not return an additional mask in this case
-    if token_type_ids is None:
-        return None
+@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+def get_block_sequence_ids_for_mask(mm_token_type_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+    mm_token_type_ids = mm_token_type_ids.to(device)
 
-    def inner_mask(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-        seq_length = image_group_ids.shape[-1]
-
-        # clamp indices because with static cache they can go beyond `image_group_ids.shape[-1]`
-        q_idx_clamped = q_idx.clamp(max=seq_length - 1)
-        kv_idx_clamped = kv_idx.clamp(max=seq_length - 1)
-
-        # Unmask if the q and kv come from same group which is not -1 (i.e. non-text)
-        q_group = image_group_ids[batch_idx, q_idx_clamped]
-        kv_group = image_group_ids[batch_idx, kv_idx_clamped]
-        q_group = torch.where(q_idx < seq_length, q_group, -1)
-        kv_group = torch.where(kv_idx < seq_length, kv_group, -1)
-        return (q_group == kv_group) & (q_group >= 0)
-
-    return inner_mask
-
-
-def create_causal_mask_mapping(
-    config: PreTrainedConfig,
-    inputs_embeds: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    past_key_values: Cache | None,
-    position_ids: torch.Tensor | None,
-    mm_token_type_ids: torch.Tensor | None = None,
-    pixel_values: torch.FloatTensor | None = None,
-    is_training: bool = False,
-    is_first_iteration: bool | None = None,
-    **kwargs,
-) -> dict:
-    """
-    Overwrites the base `create_masks_for_generate` with `token_type_ids` masking to create the causal mask mapping
-    for all kinds of forward passes. Gemma4 uses a bidirectional mask for images.
-
-    Uses `pixel_values` as an optional input to disambiguate edge cases.
-    """
-    if is_training and mm_token_type_ids is None:
-        raise ValueError("`mm_token_type_ids` is required as a model input when training")
-
-    mask_kwargs = {
-        "config": config.get_text_config(),
-        "inputs_embeds": inputs_embeds,
-        "attention_mask": attention_mask,
-        "past_key_values": past_key_values,
-        "position_ids": position_ids,
-    }
-    sliding_mask_kwargs = mask_kwargs.copy()
-
-    # NOTE: this `may_have_image_input` logic is not flawless, it fails when we're using a cache eagerly initialized
-    # (e.g. compiled prefill) AND `pixel_values` are not provided (i.e. the image data is provided through other
-    # means). Determining prefill in that case requires checking data values, which is not compile-compatible.
-    is_first_iteration = (
-        is_first_iteration
-        if is_first_iteration is not None
-        else (past_key_values is None or not past_key_values.is_initialized or pixel_values is not None)
-    )
-    if mm_token_type_ids is not None and is_first_iteration:
-        # We need to pass an additional mask function to account for token type ids, and it needs to be an `or` (to
-        # undo the causal masking)
-
-        # First find where a new vision block starts. Vision tokens cannot attend to
-        # future vision tokens, but can attend to all prev tokens and to itself bidirectionally
-        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
-        is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
-        is_prev_vision[..., 0] = False
-        new_vision_starts = is_vision & ~is_prev_vision
-        vision_group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
-        vision_group_ids = torch.where(is_vision, vision_group_ids, -1)
-        sliding_mask_kwargs["or_mask_function"] = token_type_ids_mask_function(
-            mm_token_type_ids.to(inputs_embeds.device), vision_group_ids
-        )
-
-    return {
-        "full_attention": create_causal_mask(**mask_kwargs),
-        "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
-    }
+    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+    is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
+    is_prev_vision[..., 0] = False
+    new_vision_starts = is_vision & ~is_prev_vision
+    vision_group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
+    block_sequence_ids = torch.where(is_vision, vision_group_ids, -1)
+    return block_sequence_ids
 
 
 @torch.compiler.disable(recursive = False)
@@ -1443,6 +1378,7 @@ def Gemma4ForConditionalGeneration_forward(
     labels: torch.LongTensor | None = None,
     use_cache: bool | None = None,
     logits_to_keep: int | torch.Tensor = 0,
+    per_layer_inputs: torch.Tensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Gemma4CausalLMOutputWithPast:
     r"""
@@ -1454,6 +1390,12 @@ def Gemma4ForConditionalGeneration_forward(
     video_position_ids (`torch.LongTensor` of shape `(num_videos, num_frames, max_patches, 2)`, *optional*):
         2D patch position coordinates from the video processor, with `(-1, -1)` indicating padding.
         Passed through to the vision encoder for positional embedding computation.
+    per_layer_inputs (`torch.Tensor`, *optional*):
+        Pre-computed per-layer input text embeddings of shape `(batch_size, sequence_length, num_hidden_layers,
+        hidden_size_per_layer_input)`. When provided, these are used directly instead of being computed from `input_ids`
+        via `get_per_layer_inputs()` in the text model. If calling the `forward` with `inputs_embeds` instead of `input_ids`,
+        you should probably precompute them and forward them along `inputs_embeds`, otherwise recomputing them needs
+        to reverse the main embedding, which is expensive.
     """
     outputs = self.model(
         input_ids=input_ids,
@@ -1466,6 +1408,7 @@ def Gemma4ForConditionalGeneration_forward(
         past_key_values=past_key_values,
         mm_token_type_ids=mm_token_type_ids,
         inputs_embeds=inputs_embeds,
+        per_layer_inputs=per_layer_inputs,
         labels=labels,
         use_cache=use_cache,
         image_position_ids=image_position_ids,
@@ -1482,25 +1425,29 @@ def Gemma4ForConditionalGeneration_forward(
     NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
     RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
     
-    all_locals = locals()
     n_items = None
-    if 'loss_kwargs' in all_locals:
-        __kwargs = all_locals['loss_kwargs']
-        if type(__kwargs) is dict:
-            n_items = __kwargs.get("num_items_in_batch", None)
-            if n_items is None: n_items = __kwargs.get("n_items", None)
-    if n_items is None and 'kwargs' in all_locals:
-        __kwargs = all_locals['kwargs']
-        if type(__kwargs) is dict:
-            n_items = __kwargs.get("num_items_in_batch", None)
-            if n_items is None: n_items = __kwargs.get("n_items", None)
+    if (kwargs) != () and type(kwargs) is dict:
+        n_items = (kwargs).get("num_items_in_batch", None)
+        if n_items is None: n_items = (kwargs).get("n_items", None)
     if n_items is None:
-        all_locals = all_locals.values()
-        for __kwargs in all_locals:
+        all_locals = locals()
+        if 'loss_kwargs' in all_locals:
+            __kwargs = all_locals['loss_kwargs']
             if type(__kwargs) is dict:
                 n_items = __kwargs.get("num_items_in_batch", None)
                 if n_items is None: n_items = __kwargs.get("n_items", None)
-                break
+        if n_items is None and 'kwargs' in all_locals:
+            __kwargs = all_locals['kwargs']
+            if type(__kwargs) is dict:
+                n_items = __kwargs.get("num_items_in_batch", None)
+                if n_items is None: n_items = __kwargs.get("n_items", None)
+        if n_items is None:
+            all_locals = all_locals.values()
+            for __kwargs in all_locals:
+                if type(__kwargs) is dict:
+                    n_items = __kwargs.get("num_items_in_batch", None)
+                    if n_items is None: n_items = __kwargs.get("n_items", None)
+                    break
     pass
     
     requires_grad_ = self.lm_head.weight.requires_grad
@@ -1541,7 +1488,15 @@ def Gemma4ForConditionalGeneration_forward(
         INFERENCE_RUNS += 1
     
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-    else:
+    elif (() == () and () == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+        loss = fused_linear_cross_entropy(
+            hidden_states      = hidden_states[:, slice_indices, :],
+            lm_weight          = self.lm_head.weight,
+            labels             = labels.to(self.lm_head.weight.device),
+            num_items_in_batch = n_items,
+            logit_softcapping  = None if (self.config.get_text_config().final_logit_softcapping) == () else (self.config.get_text_config().final_logit_softcapping),
+        )
+    elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and NOT_RETURN_LOGITS:
         lm_head_weight = self.lm_head.weight
         lm_head_bias   = getattr(self.lm_head, "bias", None)
     
@@ -1549,15 +1504,13 @@ def Gemma4ForConditionalGeneration_forward(
         _hidden_states = hidden_states[:, slice_indices, :]
         torch._dynamo.mark_dynamic(_hidden_states, 1)
         torch._dynamo.mark_dynamic(labels, 1)
-        if attention_mask is not None:
-            torch._dynamo.mark_dynamic(attention_mask, 1)
         loss = unsloth_fused_ce_loss(
             trainer              = None,
             hidden_states        = _hidden_states,
             lm_head_weight       = lm_head_weight,
             lm_head_bias         = lm_head_bias,
             labels               = labels,
-            mask                 = attention_mask,
+            mask                 = None,
             n_items              = n_items,
             scaling              = getattr(self, "accelerator_scaler", None),
             target_gb            = None,
@@ -1566,6 +1519,31 @@ def Gemma4ForConditionalGeneration_forward(
             logit_scale_divide   = () if () != () else 0,
             logit_softcapping    = (self.config.get_text_config().final_logit_softcapping) if (self.config.get_text_config().final_logit_softcapping) != () else 0,
         )
+    elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
+        # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
+        # already materialised the full lm_head matmul; apply the captured logit
+        # scale/softcap transforms and route loss through self.loss_function on
+        # those logits instead of letting unsloth_fused_ce_loss redo the matmul.
+        if () != ():
+            logits = logits * ()
+        if () != ():
+            logits = logits / ()
+        if (self.config.get_text_config().final_logit_softcapping) not in (None, (),):
+            logits = logits / (self.config.get_text_config().final_logit_softcapping)
+            logits = torch.tanh(logits)
+            logits = logits * (self.config.get_text_config().final_logit_softcapping)
+        loss = self.loss_function(logits, labels.to(self.lm_head.weight.device), vocab_size=self.config.get_text_config().vocab_size, **kwargs)
+    else:
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        if () != ():
+            logits = logits * ()
+        if () != ():
+            logits = logits / ()
+        if (self.config.get_text_config().final_logit_softcapping) not in (None, (),):
+            logits = logits / (self.config.get_text_config().final_logit_softcapping)
+            logits = torch.tanh(logits)
+            logits = logits * (self.config.get_text_config().final_logit_softcapping)
+        loss = self.loss_function(logits, labels.to(self.lm_head.weight.device), vocab_size=self.config.get_text_config().vocab_size, **kwargs)
 
 
     return Gemma4CausalLMOutputWithPast(
@@ -1576,10 +1554,12 @@ def Gemma4ForConditionalGeneration_forward(
         attentions=outputs.attentions,
         image_hidden_states=outputs.image_hidden_states,
         audio_hidden_states=outputs.audio_hidden_states,
+        shared_kv_states=outputs.shared_kv_states,
     )
 
 class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+    accepts_loss_kwargs = False
     base_model_prefix = "model"
 
     def __init__(self, config: Gemma4Config):
@@ -1587,12 +1567,6 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         self.model = Gemma4Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.model.set_input_embeddings(value)
 
     def get_image_features(
         self,
@@ -1625,9 +1599,10 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        per_layer_inputs: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Gemma4CausalLMOutputWithPast:
-        return Gemma4ForConditionalGeneration_forward(self, input_ids=input_ids, pixel_values=pixel_values, pixel_values_videos=pixel_values_videos, input_features=input_features, attention_mask=attention_mask, input_features_mask=input_features_mask, position_ids=position_ids, image_position_ids=image_position_ids, video_position_ids=video_position_ids, past_key_values=past_key_values, mm_token_type_ids=mm_token_type_ids, inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache, logits_to_keep=logits_to_keep, **kwargs)
+        return Gemma4ForConditionalGeneration_forward(self, input_ids=input_ids, pixel_values=pixel_values, pixel_values_videos=pixel_values_videos, input_features=input_features, attention_mask=attention_mask, input_features_mask=input_features_mask, position_ids=position_ids, image_position_ids=image_position_ids, video_position_ids=video_position_ids, past_key_values=past_key_values, mm_token_type_ids=mm_token_type_ids, inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache, logits_to_keep=logits_to_keep, per_layer_inputs=per_layer_inputs, **kwargs)
 
     def prepare_inputs_for_generation(
         self,
@@ -1667,8 +1642,21 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
             model_inputs["pixel_values_videos"] = pixel_values_videos
             model_inputs["input_features"] = input_features
             model_inputs["input_features_mask"] = input_features_mask
+        else:
+            # Don't pass to not apply bidirectional mask on top
+            model_inputs["mm_token_type_ids"] = None
+
+        # If `per_layer_inputs` was provided along with `inputs_embeds` for first forward, drop it for subsequent forwards
+        if not is_first_iteration:
+            _ = model_inputs.pop("per_layer_inputs", None)
 
         return model_inputs
+
+    def get_per_layer_input_embeddings(self):
+        return self.model.get_per_layer_input_embeddings()
+
+    def set_per_layer_input_embeddings(self, value):
+        self.model.set_per_layer_input_embeddings(value)
 
     @staticmethod
     def create_masks_for_generate(
@@ -1681,22 +1669,23 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         is_first_iteration: bool | None = False,
         **kwargs,
     ) -> dict:
+        mask_kwargs = {
+            "config": config.get_text_config(),
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+
+        # Larger Gemma 4 models use Gemma 3's bidirectional attention mask for vision inputs
+        # Smaller Gemma models use a conventional casual attention mask
         if getattr(config.get_text_config(), "use_bidirectional_attention", None) == "vision":
-            # Larger Gemma 4 models use Gemma 3's bidirectional attention mask for vision inputs
-            return create_causal_mask_mapping(
-                config,
-                inputs_embeds,
-                attention_mask,
-                past_key_values,
-                position_ids,
-                mm_token_type_ids,
-                is_first_iteration=is_first_iteration,
-                **{k: v for k, v in kwargs.items() if k != "pixel_values"},
-            )
-        else:
-            # Smaller Gemma models use a conventional casual attention mask
-            return create_masks_for_generate(
-                config, inputs_embeds, attention_mask, past_key_values, position_ids, **kwargs
-            )
+            block_sequence_ids = torch.full([*inputs_embeds.size()[:-1]], -1, device=inputs_embeds.device)
+            if mm_token_type_ids is not None:
+                block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
+
+            mask_kwargs["block_sequence_ids"] = block_sequence_ids
+
+        return create_masks_for_generate(**mask_kwargs)
 
 Gemma4ForConditionalGeneration.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True

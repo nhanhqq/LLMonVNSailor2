@@ -1,8 +1,8 @@
 """
 2026.6.5
 2026.6.7
-5.5.0
-0.24.0
+5.13.0.dev0
+0.23.0
 __UNSLOTH_VERSIONING__
 """
 
@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from unsloth_zoo.temporary_patches.common import torch_compile
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from trl.trainer.xpo_trainer import (Any, BaseImageProcessor, BasePairwiseJudge, Callable, Dataset, EvalPrediction, F, FeatureExtractionMixin, IterableDataset, OnlineDPOTrainer, OptimizerNames, Optional, PeftModel, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SIMPLE_CHAT_TEMPLATE, TrainerCallback, Union, XPOConfig, XPOTrainer, empty_cache, get_reward, is_conversational, is_peft_available, jinja2, maybe_apply_chat_template, nn, selective_log_softmax, textwrap, torch, truncate_right, unwrap_model_for_generation)
+from trl.trainer.xpo_trainer import (Any, BaseImageProcessor, BasePairwiseJudge, Callable, Dataset, EvalPrediction, F, FeatureExtractionMixin, IterableDataset, OnlineDPOTrainer, OptimizerNames, Optional, PeftModel, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SIMPLE_CHAT_TEMPLATE, TrainerCallback, Union, XPOConfig, XPOTrainer, empty_cache, generate_model_card, get_comet_experiment_url, get_reward, is_conversational, is_peft_available, is_wandb_available, jinja2, maybe_apply_chat_template, nn, os, selective_log_softmax, textwrap, torch, truncate_right, unwrap_model_for_generation)
 
 
 import os
@@ -425,7 +425,9 @@ class UnslothXPOConfig(XPOConfig):
         report_to = 'none',
         run_name = None,
         project = 'huggingface',
-        trackio_space_id = 'trackio',
+        trackio_space_id = None,
+        trackio_bucket_id = None,
+        trackio_static_space_id = None,
         eval_strategy = 'no',
         eval_steps = None,
         eval_delay = 0,
@@ -472,6 +474,7 @@ class UnslothXPOConfig(XPOConfig):
         ddp_find_unused_parameters = None,
         ddp_bucket_cap_mb = None,
         ddp_broadcast_buffers = None,
+        ddp_static_graph = None,
         ddp_backend = None,
         ddp_timeout = 1800,
         fsdp = None,
@@ -595,6 +598,8 @@ class UnslothXPOConfig(XPOConfig):
             run_name = run_name,
             project = project,
             trackio_space_id = trackio_space_id,
+            trackio_bucket_id = trackio_bucket_id,
+            trackio_static_space_id = trackio_static_space_id,
             eval_strategy = eval_strategy,
             eval_steps = eval_steps,
             eval_delay = eval_delay,
@@ -641,6 +646,7 @@ class UnslothXPOConfig(XPOConfig):
             ddp_find_unused_parameters = ddp_find_unused_parameters,
             ddp_bucket_cap_mb = ddp_bucket_cap_mb,
             ddp_broadcast_buffers = ddp_broadcast_buffers,
+            ddp_static_graph = ddp_static_graph,
             ddp_backend = ddp_backend,
             ddp_timeout = ddp_timeout,
             fsdp = fsdp,
@@ -701,22 +707,9 @@ class UnslothXPOConfig(XPOConfig):
 pass
 
 class _UnslothXPOTrainer(OnlineDPOTrainer):
-    """"""
+    r""""""
 
     _tag_names = ["trl", "xpo"]
-    _name = "XPO"
-    _paper = {
-        "title": "Exploratory Preference Optimization: Harnessing Implicit Q*-Approximation for Sample-Efficient RLHF",
-        "id": "2405.21046",
-        # docstyle-ignore
-        "citation": textwrap.dedent("""\
-            @article{jung2024binary,
-                title        = {{Exploratory Preference Optimization: Harnessing Implicit Q*-Approximation for Sample-Efficient RLHF}},
-                author       = {Tengyang Xie and Dylan J. Foster and Akshay Krishnamurthy and Corby Rosset and Ahmed Awadallah and Alexander Rakhlin},
-                year         = 2024,
-                eprint       = {arXiv:2405.21046}
-            }"""),
-    }
 
     def __init__(
         self,
@@ -1141,39 +1134,106 @@ class _UnslothXPOTrainer(OnlineDPOTrainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        self.accelerator.backward(loss, **kwargs)
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss, **kwargs)
 
         return loss.detach() / self.args.gradient_accumulation_steps
+
+    def create_model_card(
+        self,
+        model_name: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        tags: Union[str, list[str], None] = None,
+    ):
+        """
+        Creates a draft of a model card using the information available to the `Trainer`.
+
+        Args:
+            model_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the model.
+            dataset_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the dataset used for training.
+            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
+                Tags to be associated with the model card.
+        """
+        if not self.is_world_process_zero():
+            return
+
+        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
+            base_model = self.model.config._name_or_path
+        else:
+            base_model = None
+
+        # normalize `tags` to a mutable set
+        if tags is None:
+            tags = set()
+        elif isinstance(tags, str):
+            tags = {tags}
+        else:
+            tags = set(tags)
+
+        if hasattr(self.model.config, "unsloth_version"):
+            tags.add("unsloth")
+
+        if "JOB_ID" in os.environ:
+            tags.add("hf_jobs")
+
+        tags.update(self._tag_names)
+
+        # docstyle-ignore
+        citation = textwrap.dedent("""\
+        @article{jung2024binary,
+            title        = {{Exploratory Preference Optimization: Harnessing Implicit Q*-Approximation for Sample-Efficient RLHF}},
+            author       = {Tengyang Xie and Dylan J. Foster and Akshay Krishnamurthy and Corby Rosset and Ahmed Awadallah and Alexander Rakhlin},
+            year         = 2024,
+            eprint       = {arXiv:2405.21046}
+        }""")
+
+        model_card = generate_model_card(
+            base_model=base_model,
+            model_name=model_name,
+            hub_model_id=self.hub_model_id,
+            dataset_name=dataset_name,
+            tags=tags,
+            wandb_url=wandb.run.url if is_wandb_available() and wandb.run is not None else None,
+            comet_url=get_comet_experiment_url(),
+            trainer_name="XPO",
+            trainer_citation=citation,
+            paper_title="Exploratory Preference Optimization: Harnessing Implicit Q*-Approximation for Sample-Efficient RLHF",
+            paper_id="2405.21046",
+        )
+
+        model_card.save(os.path.join(self.args.output_dir, "README.md"))
 class UnslothXPOTrainer(_UnslothXPOTrainer):
     """
     
-    Trainer for Exploratory Preference Optimization (XPO).
-
-    It is implemented as a subclass of [`OnlineDPOTrainer`].
+    Initialize XPOTrainer as a subclass of [`OnlineDPOConfig`].
 
     Args:
-        model ([`~transformers.PreTrainedModel`]):
+        model (`transformers.PreTrainedModel`):
             The model to train, preferably an `AutoModelForCausalLM`.
-        ref_model ([`PreTrainedModelWrapper`]):
+        ref_model (`PreTrainedModelWrapper`):
             Hugging Face transformer model with a casual language modelling head. Used for implicit reward computation
             and loss. If no reference model is provided, the trainer will create a reference model with the same
             architecture as the model to be optimized.
-        reward_funcs ([`~transformers.PreTrainedModel`]):
-            The reward model to score completions with, preferably an
-            [`~transformers.AutoModelForSequenceClassification`].
-        judge ([`BasePairwiseJudge`]):
+        reward_funcs (`transformers.PreTrainedModel`):
+            The reward model to score completions with, preferably an `AutoModelForSequenceClassification`.
+        judge (`BasePairwiseJudge`):
             The judge to use for pairwise comparison of model completions.
-        args ([`XPOConfig`]):
+        args (`XPOConfig`):
             The XPO config arguments to use for training.
-        data_collator ([`~transformers.DataCollator`]):
+        data_collator (`transformers.DataCollator`):
             The data collator to use for training. If None is specified, the default data collator
-            ([`DPODataCollatorWithPadding`]) will be used which will pad the sequences to the maximum length of the
+            (`DPODataCollatorWithPadding`) will be used which will pad the sequences to the maximum length of the
             sequences in the batch, given a dataset of paired sequences.
-        train_dataset ([`~datasets.Dataset`]):
+        train_dataset (`datasets.Dataset`):
             The dataset to use for training.
-        eval_dataset ([`~datasets.Dataset`]):
+        eval_dataset (`datasets.Dataset`):
             The dataset to use for evaluation.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`], *optional*):
+        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`], *optional*, defaults to `None`):
             Processing class used to process the data. If provided, will be used to automatically process the inputs
             for the model, and it will be saved along the model to make it easier to rerun an interrupted training or
             reuse the fine-tuned model.
@@ -1189,13 +1249,12 @@ class UnslothXPOTrainer(_UnslothXPOTrainer):
         preprocess_logits_for_metrics (`Callable[[torch.Tensor, torch.Tensor], torch.Tensor]`):
             The function to use to preprocess the logits before computing the metrics.
 
-        reward_model:
+    .. deprecated:: 0.22.0
+        The following parameters are deprecated and will be removed in a future version:
 
-            <Deprecated version="0.22.0">
-
-            This parameter is deprecated and will be removed in version 0.25.0. Use `reward_funcs` instead.
-
-            </Deprecated>
+        * `reward_model`: Use `reward_funcs` instead. For example, change `reward_model=model` to `reward_funcs=model`.
+        * `reward_processing_class`: Use `reward_processing_classes` instead. For example, change
+          `reward_processing_class=tokenizer` to `reward_processing_classes=tokenizer`.
     
     """
     def __init__(

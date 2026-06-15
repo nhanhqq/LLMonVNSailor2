@@ -91,6 +91,7 @@ trainer = SFTTrainer(
         output_dir="outputs",
         disable_tqdm=False,
         report_to="none",
+        remove_unused_columns=False,
     ),
     callbacks=[ProcessTitleCallback()],
 )
