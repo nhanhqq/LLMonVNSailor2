@@ -49,7 +49,7 @@ def formatting_prompts_func(examples):
         ]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         texts.append(text)
-    return {"text": texts}
+    return tokenizer(texts, padding=False, truncation=True, max_length=max_seq_length)
 
 subsets = ["BKAI_RAG", "LegalRAG", "expert", "viQuAD"]
 dataset_list = []
@@ -58,7 +58,7 @@ for subset in subsets:
     dataset_list.append(ds)
 
 dataset = concatenate_datasets(dataset_list)
-dataset = dataset.map(formatting_prompts_func, batched=True)
+dataset = dataset.map(formatting_prompts_func, batched=True, remove_columns=dataset.column_names)
 
 class ProcessTitleCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -67,14 +67,16 @@ class ProcessTitleCallback(TrainerCallback):
             loss = logs.get("loss", 0.0)
             setproctitle.setproctitle(f"Train - Step: {step} Loss: {loss:.4f}")
 
+from transformers import DataCollatorForLanguageModeling
+
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     train_dataset=dataset,
-    dataset_text_field="text",
     max_seq_length=max_seq_length,
     dataset_num_proc=2,
     packing=False,
+    data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
     args=TrainingArguments(
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
@@ -91,7 +93,6 @@ trainer = SFTTrainer(
         output_dir="outputs",
         disable_tqdm=False,
         report_to="none",
-        remove_unused_columns=False,
     ),
     callbacks=[ProcessTitleCallback()],
 )
