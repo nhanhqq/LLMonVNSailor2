@@ -6,5 +6,8 @@ peft
 accelerate
 bitsandbytes
 xformers
-unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+unsloth
 requests
+setproctitle
+pandas
+matplotlib

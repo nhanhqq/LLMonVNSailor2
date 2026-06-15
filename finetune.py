@@ -1,7 +1,10 @@
 import torch
+import pandas as pd
+import matplotlib.pyplot as plt
 from datasets import load_dataset, concatenate_datasets
 from trl import SFTTrainer
-from transformers import TrainingArguments
+from transformers import TrainingArguments, TrainerCallback
+import setproctitle
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
 
@@ -57,6 +60,13 @@ for subset in subsets:
 dataset = concatenate_datasets(dataset_list)
 dataset = dataset.map(formatting_prompts_func, batched=True)
 
+class ProcessTitleCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is not None:
+            step = state.global_step
+            loss = logs.get("loss", 0.0)
+            setproctitle.setproctitle(f"Train - Step: {step} Loss: {loss:.4f}")
+
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
@@ -80,9 +90,30 @@ trainer = SFTTrainer(
         seed=3407,
         output_dir="outputs",
     ),
+    callbacks=[ProcessTitleCallback()],
 )
 
 trainer.train()
+
+# Log full metrics to CSV
+log_history = trainer.state.log_history
+df = pd.DataFrame(log_history)
+df.to_csv("training_logs.csv", index=False)
+
+# Plot training loss
+loss_history = [log for log in log_history if "loss" in log]
+if loss_history:
+    steps = [log["step"] for log in loss_history]
+    losses = [log["loss"] for log in loss_history]
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(steps, losses, marker="o", linestyle="-", color="b")
+    plt.title("Training Loss over Steps")
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.savefig("training_metrics.png")
+    plt.close()
 
 model.save_pretrained("gemma-rag-lora")
 tokenizer.save_pretrained("gemma-rag-lora")
