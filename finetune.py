@@ -45,7 +45,7 @@ def formatting_prompts_func(examples):
     for q, c, a in zip(questions, contexts, answers):
         messages = [
             {"role": "user", "content": f"Dựa vào thông tin sau:\n{c}\n\nCâu hỏi: {q}"},
-            {"role": "model", "content": a}
+            {"role": "assistant", "content": a}
         ]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         texts.append(text)
