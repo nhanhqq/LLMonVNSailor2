@@ -12,3 +12,4 @@ setproctitle
 pandas
 matplotlib
 tqdm
+jinja2>=3.1.0
