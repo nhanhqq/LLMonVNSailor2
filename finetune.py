@@ -1,3 +1,5 @@
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template
 import torch
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -5,15 +7,13 @@ from datasets import load_dataset, concatenate_datasets
 from trl import SFTTrainer
 from transformers import TrainingArguments, TrainerCallback
 import setproctitle
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
 
 max_seq_length = 2048
 dtype = None
 load_in_4bit = True
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="unsloth/gemma-4-9b-it-bnb-4bit",
+    model_name="unsloth/gemma-4-e2b-it-bnb-4bit",
     max_seq_length=max_seq_length,
     dtype=dtype,
     load_in_4bit=load_in_4bit,
@@ -89,6 +89,8 @@ trainer = SFTTrainer(
         lr_scheduler_type="linear",
         seed=3407,
         output_dir="outputs",
+        disable_tqdm=False,
+        report_to="none",
     ),
     callbacks=[ProcessTitleCallback()],
 )

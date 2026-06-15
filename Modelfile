@@ -1,11 +1,2 @@
 FROM ./gemma-rag-model-unsloth.Q4_K_M.gguf
-TEMPLATE """<bos><start_of_turn>user
-{{ if .System }}<system>
-{{ .System }}</system>
-{{ end }}{{ .Prompt }}<end_of_turn>
-<start_of_turn>model
-{{ .Response }}<end_of_turn>"""
-PARAMETER stop "<start_of_turn>"
-PARAMETER stop "<end_of_turn>"
-PARAMETER stop "<bos>"
-PARAMETER stop "<eos>"
+SYSTEM "Bạn là một trợ lý ảo hỗ trợ trả lời câu hỏi tiếng Việt dựa trên thông tin được cung cấp (RAG). Hãy trả lời chính xác, ngắn gọn và đúng trọng tâm."
